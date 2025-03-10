@@ -4,7 +4,7 @@ A deep learning model for emotion recognition using both visual and audio data f
 
 ## Results
 
-![Training Results](training_history.png)
+![Training Results](results.png)
 
 The model was trained for 5 epochs, with the following results:
 - Training loss decreased steadily from 2.0 to approximately 0.1
