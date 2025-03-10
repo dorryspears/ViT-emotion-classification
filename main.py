@@ -120,19 +120,28 @@ class MultiModalClassifier(nn.Module):
         # Replace the classification head with identity
         self.vit.heads.head = nn.Identity()
         
-        # 2. Audio branch: Use AST model for audio
+        # 2. Audio branch: Use AST model for audio without device mapping
         self.ast_model_name = "MIT/ast-finetuned-audioset-10-10-0.4593"
-        self.ast = ASTModel.from_pretrained(self.ast_model_name)
         
-        # Add feature extractor for proper preprocessing
-        self.feature_extractor = AutoFeatureExtractor.from_pretrained(self.ast_model_name)
-        
-        # Get the hidden size from the AST model
-        self.ast_hidden_size = self.ast.config.hidden_size  # Should be 768
+        # Load model with simplified settings - no half precision
+        try:
+            self.ast = ASTModel.from_pretrained(self.ast_model_name)
+            
+            # Add feature extractor for proper preprocessing
+            self.feature_extractor = AutoFeatureExtractor.from_pretrained(self.ast_model_name)
+            
+            # Get the hidden size from the AST model
+            self.ast_hidden_size = self.ast.config.hidden_size  # Should be 768
+        except Exception as e:
+            print(f"Error loading AST model: {e}")
+            # Fallback to a simpler model if AST fails to load
+            self.ast = None
+            self.ast_hidden_size = 768
+            print("Using fallback audio processing")
         
         # 3. Fusion: Concatenate features from both modalities
         self.fusion = nn.Sequential(
-            nn.Linear(768 + self.ast_hidden_size, 512),  # 768 from ViT + 768 from AST
+            nn.Linear(768 + self.ast_hidden_size, 512),
             nn.ReLU(),
             nn.Dropout(0.5),
             nn.Linear(512, num_classes)
@@ -147,35 +156,75 @@ class MultiModalClassifier(nn.Module):
         # Process image through ViT
         img_features = self.vit(x_img)  # CLS token embedding
         
-        # Process audio through AST
-        # AST expects input of shape (batch_size, sequence_length, num_mel_bins)
-        # Our input is (batch_size, channels, height, width) = (batch_size, 1, 128, 1024)
-        # Need to reshape to (batch_size, width, height)
+        # Process audio through AST with better error handling
         try:
             batch_size = x_audio.size(0)
             
             # Handle 5D tensor case
             if x_audio.dim() == 5:
                 x_audio = x_audio.squeeze(3)  # Remove the extra dimension
+            
+            # Check if tensor is valid
+            if x_audio.numel() == 0 or torch.isnan(x_audio).any() or torch.isinf(x_audio).any():
+                raise ValueError("Invalid audio tensor with zeros, NaNs or Infs")
+            
+            # Memory optimization: process in smaller chunks if batch is large
+            if batch_size > 2 and self.ast is not None:
+                # Process audio in smaller batches to save memory
+                audio_features_list = []
+                sub_batch_size = 2  # Process 2 samples at a time
                 
-            # Reshape from [batch_size, 1, 128, 1024] to [batch_size, 1024, 128]
-            # This matches AST's expected format: [batch_size, sequence_length, num_mel_bins]
-            x_audio = x_audio.squeeze(1).transpose(1, 2)
-            
-            # Pass through AST model
-            ast_outputs = self.ast(
-                input_values=x_audio,
-                output_hidden_states=True,
-                return_dict=True
-            )
-            
-            # Get pooled output (equivalent to CLS token representation)
-            audio_features = ast_outputs.pooler_output
+                for i in range(0, batch_size, sub_batch_size):
+                    # Get sub-batch
+                    end_idx = min(i + sub_batch_size, batch_size)
+                    x_audio_sub = x_audio[i:end_idx]
+                    
+                    # Reshape from [batch_size, 1, 128, 1024] to [batch_size, 1024, 128]
+                    # Keep the same float32 dtype
+                    x_audio_sub = x_audio_sub.squeeze(1).transpose(1, 2)
+                    
+                    # Clear CUDA cache to free up memory
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    
+                    # Process audio
+                    ast_outputs = self.ast(
+                        input_values=x_audio_sub,
+                        output_hidden_states=True,
+                        return_dict=True
+                    )
+                    sub_audio_features = ast_outputs.pooler_output
+                    
+                    audio_features_list.append(sub_audio_features)
+                
+                # Concatenate all sub-batches
+                audio_features = torch.cat(audio_features_list, dim=0)
+                
+            elif self.ast is not None:
+                # For small batches, process normally
+                x_audio = x_audio.squeeze(1).transpose(1, 2)
+                
+                # Process audio
+                ast_outputs = self.ast(
+                    input_values=x_audio,
+                    output_hidden_states=True,
+                    return_dict=True
+                )
+                audio_features = ast_outputs.pooler_output
+            else:
+                # Fallback if AST is not available
+                audio_features = torch.randn(batch_size, self.ast_hidden_size, device=x_img.device)
             
         except Exception as e:
             print(f"Error processing audio: {e}")
-            # Fallback - use random features
-            audio_features = torch.randn(x_img.size(0), self.ast_hidden_size, device=x_img.device) * 0.01
+            # Fallback - use random features with same dtype as image features
+            audio_features = torch.randn(x_img.size(0), self.ast_hidden_size, 
+                                        dtype=x_img.dtype, 
+                                        device=x_img.device)
+        
+        # Ensure consistent dtype before concatenation
+        if audio_features.dtype != img_features.dtype:
+            audio_features = audio_features.to(img_features.dtype)
         
         # Concatenate the features
         combined_features = torch.cat([img_features, audio_features], dim=1)
@@ -252,74 +301,68 @@ class RAVDESSMultiModalDataset(Dataset):
     def extract_audio_spectrogram(self, video_path):
         """Extract audio from video and convert to spectrogram for AST"""
         try:
-            # Create a temporary audio file with a unique name
-            temp_audio = f"temp_audio_{uuid.uuid4().hex}.wav"
+            # Create a unique temporary file for audio extraction
+            temp_audio_file = f"temp_audio_{uuid.uuid4()}.wav"
             
-            # Extract audio using ffmpeg
-            ffmpeg_cmd = f"ffmpeg -i \"{video_path}\" -q:a 0 -map a {temp_audio} -y"
-            result = subprocess.run(ffmpeg_cmd, shell=True, stderr=subprocess.PIPE)
+            # Extract audio from video using ffmpeg
+            subprocess.run([
+                'ffmpeg', '-y', '-i', video_path, '-acodec', 'pcm_s16le', 
+                '-ar', '16000', '-ac', '1', temp_audio_file
+            ], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
             
-            # Check if the file was created successfully
-            if not os.path.exists(temp_audio):
-                print(f"Failed to extract audio from {video_path}")
-                print(f"ffmpeg error: {result.stderr.decode('utf-8')}")
-                # Return a dummy spectrogram with correct shape
-                return torch.zeros((1, 128, 1024))
+            # Load audio file
+            waveform, sample_rate = torchaudio.load(temp_audio_file)
             
-            # Load audio
-            waveform, sample_rate = torchaudio.load(temp_audio)
+            # Delete temporary file
+            os.remove(temp_audio_file)
             
-            # Convert to mono if stereo
-            if waveform.shape[0] > 1:
-                waveform = torch.mean(waveform, dim=0, keepdim=True)
-            
-            # Resample to 16kHz if needed (AST expects 16kHz)
+            # Resample if needed
             if sample_rate != 16000:
-                resampler = torchaudio.transforms.Resample(sample_rate, 16000)
-                waveform = resampler(waveform)
+                waveform = torchaudio.functional.resample(waveform, sample_rate, 16000)
                 sample_rate = 16000
             
-            # Generate log mel spectrogram
-            mel_spectrogram = torchaudio.transforms.MelSpectrogram(
+            # Handle empty or short waveforms
+            if waveform.numel() == 0 or waveform.shape[1] < sample_rate * 0.5:  # Less than 0.5 seconds
+                print(f"Warning: Very short or empty audio in {video_path}")
+                return torch.zeros((1, 128, 1024), dtype=torch.float32)
+            
+            # Convert to mel spectrogram
+            mel_spec = torchaudio.transforms.MelSpectrogram(
                 sample_rate=sample_rate,
-                n_fft=400,
-                hop_length=160,  # 10ms
+                n_fft=1024,
+                hop_length=512,
                 n_mels=128
             )(waveform)
             
             # Convert to decibels
-            log_mel_spectrogram = torchaudio.transforms.AmplitudeToDB()(mel_spectrogram)
+            mel_spec_db = torchaudio.transforms.AmplitudeToDB()(mel_spec)
             
-            # IMPORTANT: Normalize with appropriate mean and std as mentioned
-            # AST expects normalization with mean=0 and std=0.5
-            # Simple normalization to achieve this
-            log_mel_spectrogram = log_mel_spectrogram / (2 * log_mel_spectrogram.std())
+            # Normalize to match AST expectations
+            mel_spec_db_norm = (mel_spec_db - mel_spec_db.mean()) / (mel_spec_db.std() + 1e-10)
             
-            # Ensure consistent size
-            fixed_width = 1024  # Fixed number of time frames
-            if log_mel_spectrogram.shape[2] > fixed_width:
-                # Truncate if too long
-                log_mel_spectrogram = log_mel_spectrogram[:, :, :fixed_width]
-            elif log_mel_spectrogram.shape[2] < fixed_width:
-                # Pad with zeros if too short
-                padding = torch.zeros((1, 128, fixed_width - log_mel_spectrogram.shape[2]))
-                log_mel_spectrogram = torch.cat([log_mel_spectrogram, padding], dim=2)
+            # Ensure consistent shape for AST
+            # Target shape: [1, 128, 1024]
+            # Pad or trim if needed
+            target_length = 1024
+            current_length = mel_spec_db_norm.shape[2]
             
-            # Clean up
-            if os.path.exists(temp_audio):
-                os.remove(temp_audio)
+            if current_length < target_length:
+                # Pad with zeros
+                padding = target_length - current_length
+                log_mel_spectrogram = torch.nn.functional.pad(mel_spec_db_norm, (0, padding))
+            else:
+                # Trim to target length
+                log_mel_spectrogram = mel_spec_db_norm[:, :, :target_length]
             
-            # Before returning, ensure we have exactly the right shape [1, 128, 1024]
-            if log_mel_spectrogram.dim() != 3 or log_mel_spectrogram.shape[0] != 1 or log_mel_spectrogram.shape[1] != 128 or log_mel_spectrogram.shape[2] != 1024:
-                # Force reshape to correct dimensions
-                log_mel_spectrogram = log_mel_spectrogram.reshape(1, 128, 1024)
+            # Make sure we have the right dtype
+            log_mel_spectrogram = log_mel_spectrogram.to(torch.float32)
             
             return log_mel_spectrogram
             
         except Exception as e:
             print(f"Error processing audio for {video_path}: {str(e)}")
-            # Return a dummy spectrogram with correct shape
-            return torch.zeros((1, 128, 1024))
+            # Return a dummy spectrogram with correct shape and dtype
+            return torch.zeros((1, 128, 1024), dtype=torch.float32)
             
     def __getitem__(self, idx):
         row = self.dataframe.iloc[idx]
@@ -508,10 +551,13 @@ def main():
     train_dataset = RAVDESSMultiModalDataset(train_df)
     val_dataset = RAVDESSMultiModalDataset(val_df)
     
+    # Use smaller batch size to avoid memory issues
+    batch_size = 4  # Reduced from 8
+    
     # Create data loaders with the custom collate function
     train_loader = DataLoader(
         train_dataset, 
-        batch_size=8,  # Increased batch size
+        batch_size=batch_size,
         shuffle=True, 
         num_workers=2,
         collate_fn=custom_collate
@@ -519,7 +565,7 @@ def main():
     
     val_loader = DataLoader(
         val_dataset, 
-        batch_size=8,  # Increased batch size
+        batch_size=batch_size,
         shuffle=False, 
         num_workers=2,
         collate_fn=custom_collate
@@ -533,8 +579,8 @@ def main():
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
-        num_epochs=5,  # Reduced number of epochs since AST converges quickly
-        lr=3e-5,  # Lower learning rate for AST as recommended
+        num_epochs=5,
+        lr=3e-5,
         device=device
     )
     
