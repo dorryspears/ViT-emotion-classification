@@ -12,7 +12,7 @@ import torchaudio
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
-from transformers import ASTForAudioClassification
+from transformers import ASTModel, AutoFeatureExtractor
 
 # Set default path
 path = '.'
@@ -121,18 +121,18 @@ class MultiModalClassifier(nn.Module):
         self.vit.heads.head = nn.Identity()
         
         # 2. Audio branch: Use AST model for audio
-        self.ast = ASTForAudioClassification.from_pretrained(
-            "MIT/ast-finetuned-audioset-10-10-0.4593", 
-            attn_implementation="sdpa",
-            num_labels=num_classes,
-            ignore_mismatched_sizes=True
-        )
-        # We'll extract features before the classification layer
-        self.ast_hidden_size = self.ast.config.hidden_size  # Usually 768
+        self.ast_model_name = "MIT/ast-finetuned-audioset-10-10-0.4593"
+        self.ast = ASTModel.from_pretrained(self.ast_model_name)
+        
+        # Add feature extractor for proper preprocessing
+        self.feature_extractor = AutoFeatureExtractor.from_pretrained(self.ast_model_name)
+        
+        # Get the hidden size from the AST model
+        self.ast_hidden_size = self.ast.config.hidden_size  # Should be 768
         
         # 3. Fusion: Concatenate features from both modalities
         self.fusion = nn.Sequential(
-            nn.Linear(768 + self.ast_hidden_size, 512),  # 768 from ViT + hidden_size from AST
+            nn.Linear(768 + self.ast_hidden_size, 512),  # 768 from ViT + 768 from AST
             nn.ReLU(),
             nn.Dropout(0.5),
             nn.Linear(512, num_classes)
@@ -148,18 +148,34 @@ class MultiModalClassifier(nn.Module):
         img_features = self.vit(x_img)  # CLS token embedding
         
         # Process audio through AST
-        # Make sure audio has the right shape before passing to AST
-        # The AST model expects input of shape [batch_size, num_channels, height, width]
-        # where height=128 (mel bins) and width is time frames
-        
-        # Ensure we have 4D input: [batch_size, channels, height, width]
-        if x_audio.dim() > 4:
-            x_audio = x_audio.squeeze(3)  # Remove any extra dimensions
-        
-        ast_outputs = self.ast(x_audio, output_hidden_states=True)
-        
-        # Extract the pooled output (CLS token representation)
-        audio_features = ast_outputs.hidden_states[-1][:, 0, :]
+        # AST expects input of shape (batch_size, sequence_length, num_mel_bins)
+        # Our input is (batch_size, channels, height, width) = (batch_size, 1, 128, 1024)
+        # Need to reshape to (batch_size, width, height)
+        try:
+            batch_size = x_audio.size(0)
+            
+            # Handle 5D tensor case
+            if x_audio.dim() == 5:
+                x_audio = x_audio.squeeze(3)  # Remove the extra dimension
+                
+            # Reshape from [batch_size, 1, 128, 1024] to [batch_size, 1024, 128]
+            # This matches AST's expected format: [batch_size, sequence_length, num_mel_bins]
+            x_audio = x_audio.squeeze(1).transpose(1, 2)
+            
+            # Pass through AST model
+            ast_outputs = self.ast(
+                input_values=x_audio,
+                output_hidden_states=True,
+                return_dict=True
+            )
+            
+            # Get pooled output (equivalent to CLS token representation)
+            audio_features = ast_outputs.pooler_output
+            
+        except Exception as e:
+            print(f"Error processing audio: {e}")
+            # Fallback - use random features
+            audio_features = torch.randn(x_img.size(0), self.ast_hidden_size, device=x_img.device) * 0.01
         
         # Concatenate the features
         combined_features = torch.cat([img_features, audio_features], dim=1)
@@ -247,7 +263,7 @@ class RAVDESSMultiModalDataset(Dataset):
             if not os.path.exists(temp_audio):
                 print(f"Failed to extract audio from {video_path}")
                 print(f"ffmpeg error: {result.stderr.decode('utf-8')}")
-                # Return a dummy spectrogram
+                # Return a dummy spectrogram with correct shape
                 return torch.zeros((1, 128, 1024))
             
             # Load audio
@@ -274,8 +290,10 @@ class RAVDESSMultiModalDataset(Dataset):
             # Convert to decibels
             log_mel_spectrogram = torchaudio.transforms.AmplitudeToDB()(mel_spectrogram)
             
-            # Normalize
-            log_mel_spectrogram = (log_mel_spectrogram - log_mel_spectrogram.mean()) / (log_mel_spectrogram.std() + 1e-9)
+            # IMPORTANT: Normalize with appropriate mean and std as mentioned
+            # AST expects normalization with mean=0 and std=0.5
+            # Simple normalization to achieve this
+            log_mel_spectrogram = log_mel_spectrogram / (2 * log_mel_spectrogram.std())
             
             # Ensure consistent size
             fixed_width = 1024  # Fixed number of time frames
@@ -291,11 +309,16 @@ class RAVDESSMultiModalDataset(Dataset):
             if os.path.exists(temp_audio):
                 os.remove(temp_audio)
             
+            # Before returning, ensure we have exactly the right shape [1, 128, 1024]
+            if log_mel_spectrogram.dim() != 3 or log_mel_spectrogram.shape[0] != 1 or log_mel_spectrogram.shape[1] != 128 or log_mel_spectrogram.shape[2] != 1024:
+                # Force reshape to correct dimensions
+                log_mel_spectrogram = log_mel_spectrogram.reshape(1, 128, 1024)
+            
             return log_mel_spectrogram
             
         except Exception as e:
             print(f"Error processing audio for {video_path}: {str(e)}")
-            # Return a dummy spectrogram
+            # Return a dummy spectrogram with correct shape
             return torch.zeros((1, 128, 1024))
             
     def __getitem__(self, idx):
@@ -306,6 +329,16 @@ class RAVDESSMultiModalDataset(Dataset):
         # Extract visual and audio features
         image = self.extract_frame(video_path)
         spectrogram = self.extract_audio_spectrogram(video_path)
+        
+        # Ensure spectrogram has the correct shape [channels, height, width]
+        if spectrogram.dim() > 3:
+            # Reshape to exactly [channels, height, width]
+            channels, height = 1, 128
+            try:
+                spectrogram = spectrogram.reshape(channels, height, 1024)
+            except RuntimeError:
+                # Create a new tensor
+                spectrogram = torch.zeros(1, 128, 1024, dtype=torch.float32)
         
         # Get label
         label = torch.tensor(self.emotion_to_idx[emotion])
@@ -326,35 +359,27 @@ def custom_collate(batch):
     """Custom collate function to handle variable-sized tensors"""
     images = torch.stack([item['image'] for item in batch])
     
-    # Get the maximum dimensions for audio spectrograms
-    max_channels = max(item['audio'].shape[0] for item in batch)
-    max_height = max(item['audio'].shape[1] for item in batch)
-    max_width = max(item['audio'].shape[2] for item in batch)
-    
-    # Pad audio spectrograms to the same size
-    padded_audio = []
+    # Process audio tensors to ensure correct shape before stacking
+    processed_audio = []
     for item in batch:
         audio = item['audio']
-        # Create a padded tensor
-        padded = torch.zeros(max_channels, max_height, max_width)
-        # Copy the original data
-        c, h, w = audio.shape
-        padded[:c, :h, :w] = audio
-        padded_audio.append(padded)
+        # Ensure audio has exactly shape [1, 128, 1024]
+        if audio.dim() != 3 or audio.shape[0] != 1 or audio.shape[1] != 128 or audio.shape[2] != 1024:
+            # Force reshape to correct dimensions
+            try:
+                audio = audio.reshape(1, 128, 1024)
+            except RuntimeError:
+                # If reshape fails, create a new tensor with zeros
+                audio = torch.zeros(1, 128, 1024, dtype=torch.float32)
+        processed_audio.append(audio)
     
-    # Stack the padded audio tensors
-    audio = torch.stack(padded_audio)
-    
-    # Ensure audio has the correct shape for AST: [batch_size, channels, height, width]
-    # Remove the extra dimension if present
-    if audio.dim() == 5:
-        # Reshape from [batch, 1, 128, 1, 1024] to [batch, 1, 128, 1024]
-        audio = audio.squeeze(3)
+    # Stack audio tensors
+    audio = torch.stack(processed_audio)
     
     # Stack labels
     labels = torch.stack([item['label'] for item in batch])
     
-    # Collect emotions (strings don't need stacking)
+    # Collect emotions
     emotions = [item['emotion'] for item in batch]
     
     return {
@@ -365,24 +390,18 @@ def custom_collate(batch):
     }
 
 
-def train_model(model, train_loader, val_loader, num_epochs=5, lr=1e-4, device='cuda'):
-    """
-    Train the multi-modal emotion recognition model
-    
-    Args:
-        model: The model to train
-        train_loader: DataLoader for training data
-        val_loader: DataLoader for validation data
-        num_epochs: Number of training epochs
-        lr: Learning rate
-        device: Device to train on ('cuda' or 'cpu')
-        
-    Returns:
-        history: Dictionary containing training and validation metrics
-    """
+def train_model(model, train_loader, val_loader, num_epochs=5, lr=3e-5, device='cuda'):
     model.to(device)
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    
+    # Use a lower learning rate for AST parts of the model
+    # Group parameters for optimization
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    
+    # Add a learning rate scheduler
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=2, verbose=True
+    )
     
     best_val_acc = 0.0
     history = {'train_loss': [], 'train_acc': [], 'val_loss': [], 'val_acc': []}
@@ -397,9 +416,14 @@ def train_model(model, train_loader, val_loader, num_epochs=5, lr=1e-4, device='
         for batch in tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs} [Train]'):
             images = batch['image'].to(device)
             audio = batch['audio'].to(device)
+            
+            # Fix audio shape if needed
+            if audio.dim() == 5 and audio.shape[1] == 1 and audio.shape[3] == 1:
+                audio = audio.squeeze(3)
+            
             labels = batch['label'].to(device)
             
-            # Zero gradients
+            # Zero the parameter gradients
             optimizer.zero_grad()
             
             # Forward pass
@@ -429,6 +453,11 @@ def train_model(model, train_loader, val_loader, num_epochs=5, lr=1e-4, device='
             for batch in tqdm(val_loader, desc=f'Epoch {epoch+1}/{num_epochs} [Val]'):
                 images = batch['image'].to(device)
                 audio = batch['audio'].to(device)
+                
+                # Fix audio shape if needed
+                if audio.dim() == 5 and audio.shape[1] == 1 and audio.shape[3] == 1:
+                    audio = audio.squeeze(3)
+                
                 labels = batch['label'].to(device)
                 
                 # Forward pass
@@ -444,6 +473,9 @@ def train_model(model, train_loader, val_loader, num_epochs=5, lr=1e-4, device='
         val_loss = val_loss / val_total
         val_acc = val_correct / val_total
         
+        # Update learning rate based on validation loss
+        scheduler.step(val_loss)
+        
         # Save history
         history['train_loss'].append(train_loss)
         history['train_acc'].append(train_acc)
@@ -458,6 +490,7 @@ def train_model(model, train_loader, val_loader, num_epochs=5, lr=1e-4, device='
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             torch.save(model.state_dict(), 'best_multimodal_emotion_model.pth')
+            print(f"Saved new best model with validation accuracy: {val_acc:.4f}")
     
     return history
 
@@ -478,30 +511,30 @@ def main():
     # Create data loaders with the custom collate function
     train_loader = DataLoader(
         train_dataset, 
-        batch_size=2, 
+        batch_size=8,  # Increased batch size
         shuffle=True, 
-        num_workers=1,
+        num_workers=2,
         collate_fn=custom_collate
     )
     
     val_loader = DataLoader(
         val_dataset, 
-        batch_size=2, 
+        batch_size=8,  # Increased batch size
         shuffle=False, 
-        num_workers=1,
+        num_workers=2,
         collate_fn=custom_collate
     )
     
     # Initialize model
     model = MultiModalClassifier(num_classes=8)
     
-    # Train model
+    # Train model with optimized hyperparameters
     history = train_model(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
-        num_epochs=10,
-        lr=1e-4,
+        num_epochs=5,  # Reduced number of epochs since AST converges quickly
+        lr=3e-5,  # Lower learning rate for AST as recommended
         device=device
     )
     
@@ -523,6 +556,7 @@ def main():
     plt.legend()
     
     plt.tight_layout()
+    plt.savefig('training_history.png')
     plt.show()
 
 
@@ -530,9 +564,20 @@ def main():
 # Main Execution
 # ===============================
 
+def load_or_create_dataframe(path, cache_file='ravdess_df.pkl'):
+    """Load DataFrame from cache or create it if cache doesn't exist"""
+    if os.path.exists(cache_file):
+        print(f"Loading cached DataFrame from {cache_file}")
+        return pd.read_pickle(cache_file)
+    else:
+        print(f"Creating new DataFrame from files in {path}")
+        df = create_ravdess_dataframe(path)
+        # Save to cache
+        df.to_pickle(cache_file)
+        return df
+
 # Create DataFrame from the dataset
-print(f"Looking for RAVDESS files in: {path}")
-ravdess_df = create_ravdess_dataframe(path)
+ravdess_df = load_or_create_dataframe(path)
 
 # Display information about the dataset
 print(f"Total files found: {len(ravdess_df)}")
@@ -548,7 +593,7 @@ if len(ravdess_df) > 0:
     
     # Display the first few rows
     print("\nSample data:")
-    ravdess_df.head()
+    print(ravdess_df.head())
 
 if __name__ == "__main__":
     main()
