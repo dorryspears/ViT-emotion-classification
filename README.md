@@ -9,7 +9,7 @@ A deep learning model for emotion recognition using both visual and audio data f
 The model was trained for 5 epochs, with the following results:
 - Training loss decreased steadily from 2.0 to approximately 0.1
 - Training accuracy increased to nearly 100%
-- Validation accuracy reached around 52% after 4 epochs
+- Validation accuracy reached around 88% after 5 epochs
 
 The gap between training and validation accuracy suggests some overfitting, which could be addressed with additional regularization techniques or data augmentation.
 
